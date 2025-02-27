@@ -5,15 +5,14 @@ import numpy as np
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import message_filters
+import open3d as o3d
+import threading
 
 class KnotDetector:
     def __init__(self):
         rospy.init_node('knot_detector')
         self.bridge = CvBridge()
-        self.fx = None
-        self.fy = None
-        self.cx = None
-        self.cy = None
+        self.fx = self.fy = self.cx = self.cy = None
 
         # 订阅相机内参
         self.camera_info_sub = rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.camera_info_callback)
@@ -24,18 +23,10 @@ class KnotDetector:
         self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], queue_size=10, slop=0.5)
         self.ts.registerCallback(self.image_callback)
 
-        # 动态参数注册
-        self.canny_low = rospy.get_param("~canny_low", 25)
-        self.canny_high = rospy.get_param("~canny_high", 70)
-        self.hough_threshold = rospy.get_param("~hough_threshold", 20)
-        
-        # 参数变化回调
-        rospy.Timer(rospy.Duration(1), self.param_update_cb)
-
-    def param_update_cb(self, event):
-        self.canny_low = rospy.get_param("~canny_low", 25)
-        self.canny_high = rospy.get_param("~canny_high", 70)
-        self.hough_threshold = rospy.get_param("~hough_threshold", 20)
+        # 初始化参数
+        self.canny_low = 20
+        self.canny_high = 70
+        self.hough_threshold = 25
 
     def camera_info_callback(self, msg):
         self.fx = msg.K[0]
@@ -52,17 +43,12 @@ class KnotDetector:
         try:
             rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
             depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-           # 处理图像（例如显示或保存）
-            # cv2.imshow("RGB Image", rgb_image)
-            # cv2.imshow("Depth Image", depth_image)
-            # cv2.waitKey(1)
         except Exception as e:
             rospy.logerr(e)
             return
 
-        # self.show_image(depth_image, "depth_image")
         # 检测线段
-        lines = self.detect_lines(rgb_image)
+        lines = self.detect_lines(rgb_image, depth_image)
         if lines is None:
             return
 
@@ -98,7 +84,7 @@ class KnotDetector:
                 knot_pairs.append((i, j))
 
         self.visualize(rgb_image, valid_lines_3d, intersecting_pairs, knot_pairs)
-
+       
     def show_image(self, image, name):
         cv2.imshow(name, image)
         cv2.waitKey(1)
@@ -125,113 +111,88 @@ class KnotDetector:
         cv2.imshow("Processing Pipeline", stacked)
         cv2.waitKey(1)
 
-
     def generate_depth_mask(self, depth_image):
-        """
-        生成有效深度区域掩膜：
-        1. 排除无效深度区域
-        2. 聚焦于合理工作距离
-        """
+        """生成有效深度区域掩膜"""
         valid_depth = np.where((depth_image > 500) & (depth_image < 3000), 255, 0)
         valid_depth = valid_depth.astype(np.uint8)
-        
-        # 形态学处理填充空洞
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15,15))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         smoothed = cv2.morphologyEx(valid_depth, cv2.MORPH_CLOSE, kernel)
-        
         return smoothed
 
-    def detect_lines(self, image):
-        # 步骤1: 光照归一化
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l_channel, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        l_eq = clahe.apply(l_channel)
-        lab_eq = cv2.merge([l_eq, a, b])
-        enhanced = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+    def auto_canny_edge_detection(self, image, sigma=0.33):
+        md = np.median(image)
+        lower_value = int(max(0, (1.0 - sigma) * md))
+        upper_value = int(min(255, (1.0 + sigma) * md))
+        return cv2.Canny(image, lower_value, upper_value)
 
-        # 步骤2: 定向滤波（保留横向/纵向特征）
-        gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-        kernel_h = np.array([[ -1, 2, -1],
-                            [ -1, 2, -1],
-                            [ -1, 2, -1]], dtype=np.float32)
-        kernel_v = kernel_h.T
-        filtered_h = cv2.filter2D(gray, -1, kernel_h)
-        filtered_v = cv2.filter2D(gray, -1, kernel_v)
-        directional = cv2.addWeighted(filtered_h, 0.5, filtered_v, 0.5, 0)
+    def detect_lines(self, image, depth_image):
+        height, width, _ = image.shape
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
 
-        # 步骤3: 自适应对比度提升
-        adaptive = cv2.adaptiveThreshold(
-            directional, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 11, 2
-        )
-
-        # 步骤4: 形态学重建
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-        morph = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=2)
-        morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # 步骤5: 改进的Canny检测
-        blurred = cv2.GaussianBlur(morph, (5,5), 0)
-        edges = cv2.Canny(blurred, self.canny_low, self.canny_high, L2gradient=True)
-        # # 深度掩膜过滤（可选）
-        # depth_mask = self.generate_depth_mask(depth_image)
-        # edges = cv2.bitwise_and(edges, edges, mask=depth_mask)
-
-        # 步骤6: 概率霍夫变换参数优化
         lines = cv2.HoughLinesP(
-            edges,
+            binary,
             rho=1,
-            theta=np.pi/180,
-            threshold=self.hough_threshold,          # 更低阈值以检测更多线段
-            minLineLength=15,      # 允许更短线段
-            maxLineGap=10          # 更大的间隙容忍度
+            theta=np.pi / 180,
+            threshold=self.hough_threshold,
+            minLineLength=300,
+            maxLineGap=10
         )
-
-        # 线段合并算法（解决碎片化）
+        
+        print(f'lines: {len(lines)}', end='')
         if lines is not None:
-            lines = self.merge_lines(lines, angle_thresh=10, dist_thresh=20)
-        # 绘制检测到的线段
+            lines = self.merge_lines(lines, angle_thresh=45, dist_thresh=30, img_width=width, img_height=height, edge_buffer=50)
+        print(f' after lines: {len(lines)}')
+
         line_image = image.copy()
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-                cv2.line(line_image, (x1, y1), (x2, y2), (255, 0, 0), 2)  # 绘制线段
-        
-        # 在detect_lines中调用：
-        steps = [image, enhanced, edges, line_image]
+                cv2.line(line_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+        steps = [image, binary, line_image]
         self.visualize_process(steps)
+        # 提取每个 line[0] 的坐标到一个新的列表
+        extracted_lines = []
+        if lines is not None:
+            for line in lines:
+                # 假设 line[0] 是一个包含 [x1, y1, x2, y2] 的列表
+                if len(line) > 0 and len(line[0]) == 4:
+                    extracted_lines.append(line[0])  # 提取坐标
+        # 将提取的线段转换为 NumPy 数组
+        if len(extracted_lines) > 0:
+            lines_array = np.array(extracted_lines)  # 转换为 NumPy 数组
+            return lines_array.reshape(-1, 4)  # 确保返回形状为 (-1, 4)
+        else:
+            return np.array([]).reshape(0, 4)  # 返回一个空的 NumPy 数组，形状为 (0, 4)
 
-        return lines.reshape(-1, 4) if lines is not None else []
-
-    def merge_lines(self, lines, angle_thresh=10, dist_thresh=20):
+    def merge_lines(self, lines, angle_thresh=10, dist_thresh=20, img_width=640, img_height=480, edge_buffer=20):
         final_lines = []
-        # 确保 lines 不是空的且每个线段都是有效的
-        if len(lines) == 0 or any(len(line) != 4 for line in lines):
+
+        if len(lines) == 0 or any(len(line[0]) != 4 for line in lines):
             return np.array(final_lines)
 
-        lines = sorted(lines, key=lambda x: np.arctan2(x[3]-x[1], x[2]-x[0]))
+        # 过滤靠近图像边缘的线段
+        lines = [
+            line for line in lines
+            if (line[0][0] > edge_buffer and line[0][1] > edge_buffer and
+                line[0][2] < img_width - edge_buffer and line[0][3] < img_height - edge_buffer)
+        ]
+        print(f' 过滤图像边缘:{len(lines)}', end='')
 
-        current_line = lines[0]
-        for line in lines[1:]:
-            theta1 = np.arctan2(current_line[3]-current_line[1], current_line[2]-current_line[0])
-            theta2 = np.arctan2(line[3]-line[1], line[2]-line[0])
-            angle_diff = np.abs(theta1 - theta2) * 180 / np.pi
-            dist = np.linalg.norm(np.array(current_line[:2]) - np.array(line[2:]))
+        # 过滤非接近垂直的线段
+        lines = [
+            line for line in lines
+            if self.is_near_vertical(line[0], angle_thresh)
+        ]
+        print(f' 过滤非垂直:{len(lines)}', end='')
+        return lines
 
-            if angle_diff < angle_thresh and dist < dist_thresh:
-                x1 = min(current_line[0], line[0], current_line[2], line[2])
-                y1 = min(current_line[1], line[1], current_line[3], line[3])
-                x2 = max(current_line[0], line[0], current_line[2], line[2])
-                y2 = max(current_line[1], line[1], line[3])
-                current_line = [x1, y1, x2, y2]
-            else:
-                final_lines.append(current_line)
-                current_line = line
-
-        final_lines.append(current_line)
-        return np.array(final_lines)
+    def is_near_vertical(self, line, angle_thresh):
+        # 计算线段的角度
+        theta = np.arctan2(line[3] - line[1], line[2] - line[0]) * 180 / np.pi
+        # 判断是否接近垂直
+        return (90 - angle_thresh) <= abs(theta) <= (90 + angle_thresh)
 
 
     def get_depth_at_point(self, depth_image, x, y):
@@ -263,7 +224,6 @@ class KnotDetector:
         return None
 
     def min_distance_between_lines(self, a0, a1, b0, b1):
-        # 计算两条线段之间的最短距离
         def np_array(point):
             return np.array(point) if not isinstance(point, np.ndarray) else point
 
@@ -271,10 +231,9 @@ class KnotDetector:
         A = a1 - a0
         B = b1 - b0
         cross = np.cross(A, B)
-        denom = np.linalg.norm(cross)**2
+        denom = np.linalg.norm(cross) ** 2
 
         if denom < 1e-6:
-            # 线段平行
             return min(
                 np.linalg.norm(a0 - b0),
                 np.linalg.norm(a0 - b1),

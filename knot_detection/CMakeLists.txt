@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   rospy
   sensor_msgs
+  # dynamic_reconfigure/
 )
 
 ## System dependencies are found with CMake's conventions
@@ -91,6 +92,9 @@ find_package(catkin REQUIRED COMPONENTS
 # generate_dynamic_reconfigure_options(
 #   cfg/DynReconf1.cfg
 #   cfg/DynReconf2.cfg
+# )
+# generate_dynamic_reconfigure_options(
+#   cfg/config.cfg
 # )
 
 ###################################
