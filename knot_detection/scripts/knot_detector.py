@@ -7,6 +7,7 @@ from cv_bridge import CvBridge
 import message_filters
 import open3d as o3d
 import threading
+from sklearn.cluster import DBSCAN
 
 class KnotDetector:
     def __init__(self):
@@ -47,6 +48,7 @@ class KnotDetector:
             rospy.logerr(e)
             return
 
+        cv2.imwrite("./rgb.png",rgb_image)
         # 检测线段
         lines = self.detect_lines(rgb_image, depth_image)
         if lines is None:
@@ -91,7 +93,7 @@ class KnotDetector:
 
     def visualize_process(self, steps):
         """显示处理过程各阶段图像"""
-        titles = ["Original", "Enhanced", "Edges", "Merged Lines"]
+        titles = ["Original", "Binary", "line_image_before", "line_image"]
         
         # 确保所有图像都是三维的
         processed_steps = []
@@ -125,47 +127,95 @@ class KnotDetector:
         upper_value = int(min(255, (1.0 + sigma) * md))
         return cv2.Canny(image, lower_value, upper_value)
 
+    def filter_contours_by_bottom_edge(self, binary_image):
+        # 1. 找到轮廓
+        contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 2. 获取图像的高度
+        height = binary_image.shape[0]
+
+        # 3. 存储符合条件的轮廓
+        filtered_contours = []
+
+        # 4. 过滤不挨着底边的轮廓
+        for contour in contours:
+            # 计算轮廓的边界框
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # 检查轮廓底边的 y 坐标是否接近图像底边
+            if (height - (y + h)) < 10:  # 10 像素的阈值，可以根据需要调整
+                filtered_contours.append(contour)
+
+        return filtered_contours
+
     def detect_lines(self, image, depth_image):
         height, width, _ = image.shape
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+        
+        # 二值化处理（根据实际场景调整阈值）
+        # 高斯模糊去噪（调整核大小）
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        _, binary = cv2.threshold(blurred, 70, 255, cv2.THRESH_BINARY_INV)
+        
+        # 提取轮廓
+        contours = self.filter_contours_by_bottom_edge(binary)
+        # contour_image = image.copy()  # 创建原始图像的拷贝以绘制轮廓
+        # 创建一个空白的二值图像
+        contour_image = np.zeros_like(binary)
+        # cv2.drawContours(contour_image, contours, -1, (0, 255, 0), 2)  # 绘制所有轮廓，绿色
+        cv2.drawContours(contour_image, contours, -1, (255), thickness=cv2.FILLED)
+
 
         lines = cv2.HoughLinesP(
-            binary,
+            contour_image,  # 输入细化后的骨架图像
             rho=1,
             theta=np.pi / 180,
             threshold=self.hough_threshold,
-            minLineLength=300,
-            maxLineGap=10
+            minLineLength=250,  # 根据图像尺寸调整
+            maxLineGap=20
         )
-        
-        print(f'lines: {len(lines)}', end='')
-        if lines is not None:
-            lines = self.merge_lines(lines, angle_thresh=45, dist_thresh=30, img_width=width, img_height=height, edge_buffer=50)
-        print(f' after lines: {len(lines)}')
-
-        line_image = image.copy()
+        # 绘制检测结果
+        line_image_before = image.copy()
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-                cv2.line(line_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.line(line_image_before, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-        steps = [image, binary, line_image]
-        self.visualize_process(steps)
-        # 提取每个 line[0] 的坐标到一个新的列表
+        # 合并线段
+        print(f'lines: {len(lines) if lines is not None else 0}', end='')
+        if lines is not None:
+            lines = self.merge_lines(
+                lines, 
+                angle_thresh=15,  # 降低角度阈值，避免错误合并
+                dist_thresh=10, 
+                img_width=width, 
+                img_height=height, 
+                edge_buffer=20
+            )
+        print(f' after merge: {len(lines) if lines is not None else 0}')
+        
+        # 绘制检测结果
+        line_image = image.copy()
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line
+                cv2.line(line_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        # 提取线段坐标
         extracted_lines = []
         if lines is not None:
             for line in lines:
-                # 假设 line[0] 是一个包含 [x1, y1, x2, y2] 的列表
-                if len(line) > 0 and len(line[0]) == 4:
-                    extracted_lines.append(line[0])  # 提取坐标
-        # 将提取的线段转换为 NumPy 数组
-        if len(extracted_lines) > 0:
-            lines_array = np.array(extracted_lines)  # 转换为 NumPy 数组
-            return lines_array.reshape(-1, 4)  # 确保返回形状为 (-1, 4)
-        else:
-            return np.array([]).reshape(0, 4)  # 返回一个空的 NumPy 数组，形状为 (0, 4)
+                if len(line) == 4:
+                    extracted_lines.append(line)
 
+        
+        # 可视化步骤
+        steps = [binary, contour_image, line_image_before, line_image]
+        self.visualize_process(steps)
+        
+        return np.array(extracted_lines).reshape(-1, 4) if extracted_lines else np.empty((0, 4))
+
+    
     def merge_lines(self, lines, angle_thresh=10, dist_thresh=20, img_width=640, img_height=480, edge_buffer=20):
         final_lines = []
 
@@ -180,20 +230,74 @@ class KnotDetector:
         ]
         print(f' 过滤图像边缘:{len(lines)}', end='')
 
-        # 过滤非接近垂直的线段
+        # # 过滤非接近垂直的线段
+        # lines = [
+        #     line for line in lines
+        #     if self.is_near_vertical(line[0], angle_thresh)
+        # ]
+        # print(f' 过滤非垂直:{len(lines)}', end='')
+
+        # 过滤接近水平的线段
         lines = [
             line for line in lines
-            if self.is_near_vertical(line[0], angle_thresh)
+            if not self.is_near_horizontal(line[0], angle_thresh)
         ]
-        print(f' 过滤非垂直:{len(lines)}', end='')
-        return lines
+        print(f' 过滤水平:{len(lines)}', end='')
+        
+        if len(lines) == 0:
+            return np.array(lines)
+            
+        # 计算每条线的中点和角度
+        midpoints = []
+        angles = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            midpoint = ((x1 + x2) / 2, (y1 + y2) / 2)
+            angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi  # 计算角度
+            midpoints.append(midpoint)
+            angles.append(angle)
+
+        midpoints = np.array(midpoints)
+        angles = np.array(angles)
+
+        # 构建特征向量，组合中点和角度
+        # 这里将角度归一化到[0, 360)范围内
+        angles = np.mod(angles, 360)
+        features = np.hstack((midpoints, angles.reshape(-1, 1)))  # 组合中点和角度
+
+        # 使用 DBSCAN 聚类
+        dbscan = DBSCAN(eps=dist_thresh, min_samples=1)  # eps为距离阈值
+        labels = dbscan.fit_predict(features)
+
+        # 合并相同聚类的线段
+        for label in np.unique(labels):
+            cluster_indices = np.where(labels == label)[0]
+            if len(cluster_indices) > 0:
+                # 获取属于同一聚类的所有线段
+                clustered_lines = [lines[i][0] for i in cluster_indices]
+
+                # 计算合并后的线段的最小和最大坐标
+                x1 = min(line[0] for line in clustered_lines)
+                y1 = min(line[1] for line in clustered_lines)
+                x2 = max(line[2] for line in clustered_lines)
+                y2 = max(line[3] for line in clustered_lines)
+
+                # 添加合并后的线段
+                final_lines.append((x1, y1, x2, y2))
+
+        return np.array(final_lines)
 
     def is_near_vertical(self, line, angle_thresh):
         # 计算线段的角度
         theta = np.arctan2(line[3] - line[1], line[2] - line[0]) * 180 / np.pi
         # 判断是否接近垂直
         return (90 - angle_thresh) <= abs(theta) <= (90 + angle_thresh)
-
+    
+    def is_near_horizontal(self, line, angle_thresh):
+        # 计算线段的角度
+        theta = np.arctan2(line[3] - line[1], line[2] - line[0]) * 180 / np.pi
+        # 判断是否接近水平
+        return (-angle_thresh <= theta <= angle_thresh) or (180 - angle_thresh <= theta <= 180 + angle_thresh)
 
     def get_depth_at_point(self, depth_image, x, y):
         x, y = int(round(x)), int(round(y))
