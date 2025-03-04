@@ -29,6 +29,8 @@ class KnotDetector:
         self.canny_high = 70
         self.hough_threshold = 25
 
+        self.text = ""
+
     def camera_info_callback(self, msg):
         self.fx = msg.K[0]
         self.fy = msg.K[4]
@@ -54,39 +56,104 @@ class KnotDetector:
         if lines is None:
             return
 
-        valid_lines_3d = []
-        for line in lines:
+        # 计算角度和判断打结
+        # angles, result_text = self.calculate_angles_and_check_tangles(lines, angle_threshold=40)
+        # # 在图像上绘制合并线段和角度
+        # for i, (line, angle) in enumerate(zip(lines, angles)):
+        #     x1, y1, x2, y2 = line
+            
+        #     # 绘制合并线段
+        #     cv2.line(rgb_image, (x1, y1), (x2, y2), (0, 255, 0), 2)  # 绿色线段
+
+        #     # 在合并线段的中点处绘制角度文本
+        #     mid_x = int((x1 + x2) / 2)
+        #     mid_y = int((y1 + y2) / 2)
+        #     cv2.putText(rgb_image, f"{angle:.1f} deg", (mid_x, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+        #     # 如果有下一条线段，判断两个线段最近距离，如果小于50则绘制延长线并找到交点
+            
+        #     if i < len(lines) - 1:
+        #         next_line = lines[i + 1]
+        #         # 计算当前线段和下一条线段的最近距离
+        #         distance = self.min_distance_between_lines(
+        #             (x1, y1), (x2, y2),
+        #             (next_line[0], next_line[1]), (next_line[2], next_line[3])
+        #         )
+        #         # 判断最近距离是否小于 50
+        #         if distance < 50:
+        #             # 延长当前线段
+        #             extended_line1 = (x1, y1, x1 + (x2 - x1) * 10, y1 + (y2 - y1) * 10)
+        #             extended_line2 = (next_line[0], next_line[1], next_line[2] + (next_line[2] - next_line[0]) * 10, next_line[3] + (next_line[3] - next_line[1]) * 10)
+                    
+        #             # 绘制延长线
+        #             cv2.line(rgb_image, (extended_line1[0], extended_line1[1]), (extended_line1[2], extended_line1[3]), (255, 0, 0), 1)  # 红色延长线
+        #             cv2.line(rgb_image, (extended_line2[0], extended_line2[1]), (extended_line2[2], extended_line2[3]), (255, 0, 0), 1)  # 红色延长线
+
+        #             # 计算交点
+        #             intersection = self.extend_lines_to_intersection(extended_line1, extended_line2)
+        #             if intersection:
+        #                 cv2.circle(rgb_image, intersection, 5, (0, 0, 255), -1)  # 在交点处绘制实心圆
+        #             result_text = "Cable Knotting"
+        #         else:
+        #             result_text = "Cable Not Knotted"
+        #     else:
+        #         result_text = "Cable Not Knotted"
+        # # 在图像上显示打结结果
+        # cv2.putText(rgb_image, result_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # # 显示图像
+        # cv2.imshow("Detect Result Draw Lines with Angles", rgb_image)
+        # cv2.waitKey(1)
+        # cv2.destroyAllWindows()
+
+    def calculate_angles_and_check_tangles(self, final_lines, angle_threshold=40):
+        all_angles = []  # 存储所有合并线段的锐角
+
+        for line in final_lines:
             x1, y1, x2, y2 = line
-            d1 = self.get_depth_at_point(depth_image, x1, y1)
-            d2 = self.get_depth_at_point(depth_image, x2, y2)
-            if d1 is None or d2 is None:
-                continue
+            angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi  # 计算角度
+            vertical_angle = (90 - angle) % 180  # 计算与垂直线的角度
+            sharp_angle = abs(vertical_angle)  # 取绝对值确保为非负
+            
+            # 确保锐角在 0 到 90 之间
+            if sharp_angle > 90:
+                sharp_angle = 180 - sharp_angle  # 计算锐角
+            
+            all_angles.append(sharp_angle)
 
-            p1 = self.pixel_to_3d(x1, y1, d1)
-            p2 = self.pixel_to_3d(x2, y2, d2)
-            valid_lines_3d.append((p1, p2, (x1, y1, x2, y2)))
+        # 判断是否“打结”，如果所有线段的角度都大于阈值
+        if len(all_angles) > 0 and all(angle > angle_threshold for angle in all_angles):
+            result_text = "Cable Knotting"
+        else:
+            result_text = "Cable Not Knotted"
 
-        intersecting_pairs = []
-        for i in range(len(valid_lines_3d)):
-            for j in range(i + 1, len(valid_lines_3d)):
-                line1_2d = valid_lines_3d[i][2]
-                line2_2d = valid_lines_3d[j][2]
-                intersect = self.line_intersection(line1_2d, line2_2d)
-                if intersect is not None:
-                    intersecting_pairs.append((i, j, intersect))
+        return all_angles, result_text
+    
 
-        min_distance_threshold = 0.01  # 10厘米
-        knot_pairs = []
-        for pair in intersecting_pairs:
-            i, j, point = pair
-            line1 = valid_lines_3d[i]
-            line2 = valid_lines_3d[j]
-            distance = self.min_distance_between_lines(line1[0], line1[1], line2[0], line2[1])
-            if distance < min_distance_threshold:
-                knot_pairs.append((i, j))
+    def extend_lines_to_intersection(self, line1, line2):
+        """延长给定的两条线段，返回交点坐标"""
+        x1, y1, x2, y2 = line1
+        x3, y3, x4, y4 = line2
 
-        self.visualize(rgb_image, valid_lines_3d, intersecting_pairs, knot_pairs)
-       
+        # 计算线段的斜率和截距
+        A1 = y2 - y1
+        B1 = x1 - x2
+        C1 = A1 * x1 + B1 * y1
+
+        A2 = y4 - y3
+        B2 = x3 - x4
+        C2 = A2 * x3 + B2 * y3
+
+        # 计算交点
+        det = A1 * B2 - A2 * B1
+        if det == 0:
+            return None  # 线段平行或重合
+
+        x_inter = (B2 * C1 - B1 * C2) / det
+        y_inter = (A1 * C2 - A2 * C1) / det
+
+        return int(x_inter), int(y_inter)
+
     def show_image(self, image, name):
         cv2.imshow(name, image)
         cv2.waitKey(1)
@@ -111,6 +178,30 @@ class KnotDetector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         
         cv2.imshow("Processing Pipeline", stacked)
+        cv2.waitKey(1)
+
+    # @param titles = ["Original", "Binary", "line_image_before", "line_image"]
+    # @param imshow_title "Processing Pipeline"
+    def visualize_process_with_titles(self, steps, titles, imshow_title):
+        """显示处理过程各阶段图像"""
+        # titles = ["Original", "Binary", "line_image_before", "line_image"]
+        
+        # 确保所有图像都是三维的
+        processed_steps = []
+        for img in steps:
+            if len(img.shape) == 2:  # 如果是灰度图像
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)  # 转换为三通道
+            processed_steps.append(img)
+        
+        # 进行图像堆叠
+        stacked = np.hstack([cv2.resize(img, (400, 300)) for img in processed_steps])
+        
+        # 添加标题
+        for i, title in enumerate(titles):
+            cv2.putText(stacked, title, (10 + i * 400, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        cv2.imshow(imshow_title, stacked)
         cv2.waitKey(1)
 
     def generate_depth_mask(self, depth_image):
@@ -154,9 +245,9 @@ class KnotDetector:
         
         # 二值化处理（根据实际场景调整阈值）
         # 高斯模糊去噪（调整核大小）
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        _, binary = cv2.threshold(blurred, 70, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(blurred, 80, 255, cv2.THRESH_BINARY_INV)
         
         # 提取轮廓
         contours = self.filter_contours_by_bottom_edge(binary)
@@ -191,7 +282,8 @@ class KnotDetector:
                 dist_thresh=10, 
                 img_width=width, 
                 img_height=height, 
-                edge_buffer=20
+                edge_buffer=20,
+                img=image.copy()
             )
         print(f' after merge: {len(lines) if lines is not None else 0}')
         
@@ -216,7 +308,7 @@ class KnotDetector:
         return np.array(extracted_lines).reshape(-1, 4) if extracted_lines else np.empty((0, 4))
 
     
-    def merge_lines(self, lines, angle_thresh=10, dist_thresh=20, img_width=640, img_height=480, edge_buffer=20):
+    def merge_lines(self, lines, angle_thresh=10, dist_thresh=20, img_width=640, img_height=480, edge_buffer=20, img=None):
         final_lines = []
 
         if len(lines) == 0 or any(len(line[0]) != 4 for line in lines):
@@ -246,44 +338,109 @@ class KnotDetector:
         
         if len(lines) == 0:
             return np.array(lines)
-            
-        # 计算每条线的中点和角度
-        midpoints = []
+        
+        img_shape=(img_height, img_width, 3)
+        # 计算每条线的角度和中点
         angles = []
+        midpoints = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            midpoint = ((x1 + x2) / 2, (y1 + y2) / 2)
             angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi  # 计算角度
-            midpoints.append(midpoint)
+            midpoint = ((x1 + x2) / 2, (y1 + y2) / 2)  # 计算中点
             angles.append(angle)
+            midpoints.append(midpoint)
 
-        midpoints = np.array(midpoints)
         angles = np.array(angles)
+        midpoints = np.array(midpoints)
 
-        # 构建特征向量，组合中点和角度
-        # 这里将角度归一化到[0, 360)范围内
+        # 将角度归一化到 [0, 360) 范围内
         angles = np.mod(angles, 360)
-        features = np.hstack((midpoints, angles.reshape(-1, 1)))  # 组合中点和角度
+        angles = angles.reshape(-1, 1)  # 调整形状以适合 DBSCAN
 
         # 使用 DBSCAN 聚类
         dbscan = DBSCAN(eps=dist_thresh, min_samples=1)  # eps为距离阈值
-        labels = dbscan.fit_predict(features)
+        labels = dbscan.fit_predict(angles)
 
-        # 合并相同聚类的线段
-        for label in np.unique(labels):
+        # 为每个聚类分配随机颜色
+        unique_labels = np.unique(labels)
+        colors = [tuple(np.random.randint(0, 255, 3).tolist()) for _ in unique_labels]  # 随机颜色
+
+        # 创建一个空白图像
+        # img = np.zeros(img_shape, dtype=np.uint8)
+
+        #判断是否只有两个类别
+        if len(unique_labels) == 2:
+            #计算两个聚类线段间的最近距离
+            cluster1_indices = np.where(labels == 0)[0]
+            cluster2_indices = np.where(labels == 1)[0]
+            # 计算两个聚类线段间的最近距离
+            min_distance = float('inf')
+            for i in cluster1_indices:
+                for j in cluster2_indices:
+                    distance = np.linalg.norm(np.array(midpoints[i]) - np.array(midpoints[j]))
+                    if distance < min_distance:
+                        min_distance = distance
+            print(f" min_distance:{min_distance} ", end='')
+            # 如果距离小于阈值，text标位置为"Knotting"
+            if min_distance < 420:
+                self.text = "Knotting"
+            else:
+                self.text = "Not Knotting"
+            cv2.putText(img, self.text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            # 如果只有一个聚类，text标位置为"Not Knotting"
+            cv2.putText(img, self.text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # 绘制线段和合并线段
+        for label in unique_labels:
             cluster_indices = np.where(labels == label)[0]
             if len(cluster_indices) > 0:
                 # 获取属于同一聚类的所有线段
                 clustered_lines = [lines[i][0] for i in cluster_indices]
+                # 计算聚类线段中y最小的端点和y最大的端点的x,y坐标
+                min_y_point = min(clustered_lines, key=lambda line: line[1])[:2]
+                max_y_point = max(clustered_lines, key=lambda line: line[3])[2:]
+                # 绘制两个端点
+                cv2.circle(img, tuple(min_y_point), 5, colors[label], -1)
+                cv2.circle(img, tuple(max_y_point), 5, colors[label], -1)
+                
+                x1 = int(min_y_point[0])
+                y1 = int(min_y_point[1])
+                x2 = int(max_y_point[0])
+                y2 = int(max_y_point[1])
 
-                # 计算合并后的线段的最小和最大坐标
-                x1 = min(line[0] for line in clustered_lines)
-                y1 = min(line[1] for line in clustered_lines)
-                x2 = max(line[2] for line in clustered_lines)
-                y2 = max(line[3] for line in clustered_lines)
+                # 计算x1y1 x2y2的中点坐标
+                avg_x = (x1 + x2) / 2
+                avg_y = (y1 + y2) / 2
+                # 计算x1y1 x2y2的角度
+                avg_angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi  # 计算角度
+                
 
                 # 添加合并后的线段
                 final_lines.append((x1, y1, x2, y2))
+
+                # 绘制聚类的线段
+                # for line in clustered_lines:
+                #     cv2.line(img, (int(line[0]), int(line[1])), (int(line[2]), int(line[3])), colors[label], 2)
+
+                # 绘制合并后的线段
+                cv2.line(img, (x1, y1), (x2, y2), colors[label], 2)
+                # 计算与垂直线的锐角
+                vertical_angle = (90 - avg_angle) % 180  # 计算与垂直线的角度
+                sharp_angle = abs(vertical_angle)  # 取绝对值确保为非负
+
+                # 确保锐角在 0 到 90 之间
+                if sharp_angle > 90:
+                    sharp_angle = 180 - sharp_angle  # 计算锐角
+
+                # 在合并线段的中点处绘制角度文本
+                text_position = (int(avg_x), int(avg_y))
+                cv2.putText(img, f"{sharp_angle:.1f}°", text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+
+        # 显示图像
+        cv2.imshow("DBSCAN Lines", img)
+        cv2.waitKey(1)
 
         return np.array(final_lines)
 
